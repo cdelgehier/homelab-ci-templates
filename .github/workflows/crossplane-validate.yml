@@ -181,9 +181,9 @@ jobs:
 
           RENDER_SECTIONS_FILE=$(mktemp)
 
-          # Docker host IP for function containers (bridge network workaround — same issue as CMA)
-          DOCKER_HOST_IP=$(ip route show default 2>/dev/null | awk '/default/ {print $3}' | head -1)
-          if [ -z "${DOCKER_HOST_IP}" ]; then DOCKER_HOST_IP="172.17.0.1"; fi
+          # Note: no Docker bridge workaround needed — GitHub Actions ubuntu-latest runs
+          # crossplane directly on the host alongside Docker, so 127.0.0.1 resolves correctly.
+          # The DinD workaround (-a runtime-docker-target) used in CMA causes timeouts here.
 
           for FILE in ${CHANGED_FILES}; do
             echo "[ INFO ] Rendering: ${FILE}"
@@ -214,8 +214,6 @@ jobs:
             fi
 
             RENDER_OUTPUT=$(crossplane render \
-              -a render.crossplane.io/runtime-docker-publish-address=0.0.0.0 \
-              -a "render.crossplane.io/runtime-docker-target=${DOCKER_HOST_IP}" \
               "${WORK_DIR}/xr.yaml" \
               "${WORK_DIR}/composition.yaml" \
               "${WORK_DIR}/functions.yaml" 2>&1) || true
@@ -238,7 +236,7 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: `## Crossplane Render Preview\n\nRessources qui seront créées lors du provisioning.\nBase package: \`${{ inputs.xpkg-ref }}\`.\n\n${sections}`
+              body: `## Crossplane Render Preview\n\nResources that will be created when this PR is merged.\nBase package: \`${{ inputs.xpkg-ref }}\`.\n\n${sections}`
             });
 
   # --------------------------------------------------------
