@@ -41,6 +41,7 @@ env:
   CROSSPLANE_CLI_VERSION: v2.2.0
   FUNCTION_GO_TEMPLATING_VERSION: v0.11.6
   FUNCTION_AUTO_READY_VERSION: v0.6.3
+  FUNCTION_PAT_VERSION: v0.10.3
 
 jobs:
   # --------------------------------------------------------
@@ -155,6 +156,13 @@ jobs:
           apiVersion: pkg.crossplane.io/v1beta1
           kind: Function
           metadata:
+            name: function-patch-and-transform
+          spec:
+            package: ghcr.io/crossplane-contrib/function-patch-and-transform:${FUNCTION_PAT_VERSION}
+          ---
+          apiVersion: pkg.crossplane.io/v1beta1
+          kind: Function
+          metadata:
             name: function-auto-ready
           spec:
             package: ghcr.io/crossplane-contrib/function-auto-ready:${FUNCTION_AUTO_READY_VERSION}
@@ -162,6 +170,7 @@ jobs:
 
           # Pre-pull function images to avoid timeout during render
           docker pull "ghcr.io/crossplane-contrib/function-go-templating:${FUNCTION_GO_TEMPLATING_VERSION}"
+          docker pull "ghcr.io/crossplane-contrib/function-patch-and-transform:${FUNCTION_PAT_VERSION}"
           docker pull "ghcr.io/crossplane-contrib/function-auto-ready:${FUNCTION_AUTO_READY_VERSION}"
 
       - name: Render changed claims
