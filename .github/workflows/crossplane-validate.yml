@@ -1,0 +1,310 @@
+---
+# ============================================================
+# Homelab — Crossplane claim CI (reusable workflow)
+# ============================================================
+#
+# Usage in your repo's .github/workflows/pr.yml:
+#
+#   on:
+#     pull_request:
+#       paths: ['apps/**']
+#
+#   jobs:
+#     crossplane-ci:
+#       uses: cdelgehier/homelab-ci-templates/.github/workflows/crossplane-validate.yml@main
+#       with:
+#         claims-path: apps
+#       secrets: inherit
+#
+# Required secrets (set in the calling repo or org):
+#   - none — GITHUB_TOKEN is passed automatically via secrets: inherit
+#
+# Optional inputs:
+#   - claims-path      path to claim files (default: apps)
+#   - xpkg-ref         xpkg OCI reference (default: ghcr.io/cdelgehier/homelab-xpkg:latest)
+
+name: Crossplane validate
+
+on:
+  workflow_call:
+    inputs:
+      claims-path:
+        description: "Path to claim YAML files"
+        type: string
+        default: apps
+      xpkg-ref:
+        description: "Crossplane xpkg OCI reference"
+        type: string
+        default: ghcr.io/cdelgehier/homelab-xpkg:latest
+
+env:
+  CROSSPLANE_CLI_VERSION: v2.2.0
+  FUNCTION_GO_TEMPLATING_VERSION: v0.7.0
+  FUNCTION_AUTO_READY_VERSION: v0.3.0
+
+jobs:
+  # --------------------------------------------------------
+  # Job 1: Validate claims against published xpkg
+  # --------------------------------------------------------
+  validate:
+    name: Validate claims
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install crossplane CLI
+        run: |
+          curl -sL https://raw.githubusercontent.com/crossplane/crossplane/main/install.sh \
+            | XP_VERSION=${CROSSPLANE_CLI_VERSION} sh
+          sudo mv crossplane /usr/local/bin/
+
+      - name: Extract xpkg from GHCR
+        run: |
+          WORK_DIR=$(mktemp -d)
+          echo "WORK_DIR=${WORK_DIR}" >> $GITHUB_ENV
+
+          echo "[ INFO ] Extracting ${{ inputs.xpkg-ref }}"
+          crossplane xpkg extract "${{ inputs.xpkg-ref }}" -o "${WORK_DIR}/package.gz"
+
+          mkdir -p "${WORK_DIR}/schemas"
+          gunzip -c "${WORK_DIR}/package.gz" > "${WORK_DIR}/schemas/package.yaml"
+          echo "[ INFO ] Schema size: $(wc -c < ${WORK_DIR}/schemas/package.yaml) bytes"
+
+      - name: Validate claims
+        id: validate
+        run: |
+          set +e
+          OUTPUT=$(crossplane beta validate "${WORK_DIR}/schemas/" "${{ inputs.claims-path }}/" \
+            --error-on-missing-schemas 2>&1)
+          EXIT_CODE=$?
+          set -e
+
+          echo "${OUTPUT}"
+          echo "output<<EOF" >> $GITHUB_OUTPUT
+          echo "${OUTPUT}" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          exit ${EXIT_CODE}
+
+      - name: Post PR comment (success)
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const output = `${{ steps.validate.outputs.output }}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `## Crossplane Validation ✅ PASSED\n\nAll claims in \`${{ inputs.claims-path }}/\` are valid against \`${{ inputs.xpkg-ref }}\`.\n\n<details>\n<summary>Validation output</summary>\n\n\`\`\`\n${output}\n\`\`\`\n\n</details>`
+            });
+
+      - name: Post PR comment (failure)
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const output = `${{ steps.validate.outputs.output }}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `## Crossplane Validation ❌ FAILED\n\nOne or more claims in \`${{ inputs.claims-path }}/\` failed validation against \`${{ inputs.xpkg-ref }}\`.\n\nPlease fix the errors before merging.\n\n<details>\n<summary>Validation output</summary>\n\n\`\`\`\n${output}\n\`\`\`\n\n</details>`
+            });
+
+  # --------------------------------------------------------
+  # Job 2: Render claims and post preview as PR comment
+  # --------------------------------------------------------
+  render:
+    name: Render claims
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install crossplane CLI and yq
+        run: |
+          curl -sL https://raw.githubusercontent.com/crossplane/crossplane/main/install.sh \
+            | XP_VERSION=${CROSSPLANE_CLI_VERSION} sh
+          sudo mv crossplane /usr/local/bin/
+          sudo wget -qO /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Extract and split xpkg
+        run: |
+          WORK_DIR=$(mktemp -d)
+          echo "WORK_DIR=${WORK_DIR}" >> $GITHUB_ENV
+
+          crossplane xpkg extract "${{ inputs.xpkg-ref }}" -o "${WORK_DIR}/package.gz"
+          gunzip -c "${WORK_DIR}/package.gz" > "${WORK_DIR}/package.yaml"
+
+          yq 'select(.kind == "CompositeResourceDefinition")' "${WORK_DIR}/package.yaml" \
+            > "${WORK_DIR}/xrds.yaml"
+          yq 'select(.kind == "Composition")' "${WORK_DIR}/package.yaml" \
+            > "${WORK_DIR}/compositions.yaml"
+
+          # Build functions.yaml — function names must match functionRef.name in Compositions
+          cat > "${WORK_DIR}/functions.yaml" << EOF
+          apiVersion: pkg.crossplane.io/v1beta1
+          kind: Function
+          metadata:
+            name: function-go-templating
+          spec:
+            package: ghcr.io/crossplane-contrib/function-go-templating:${FUNCTION_GO_TEMPLATING_VERSION}
+          ---
+          apiVersion: pkg.crossplane.io/v1beta1
+          kind: Function
+          metadata:
+            name: function-auto-ready
+          spec:
+            package: ghcr.io/crossplane-contrib/function-auto-ready:${FUNCTION_AUTO_READY_VERSION}
+          EOF
+
+          # Pre-pull function images to avoid timeout during render
+          docker pull "ghcr.io/crossplane-contrib/function-go-templating:${FUNCTION_GO_TEMPLATING_VERSION}"
+          docker pull "ghcr.io/crossplane-contrib/function-auto-ready:${FUNCTION_AUTO_READY_VERSION}"
+
+      - name: Render changed claims
+        id: render
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Get changed YAML files in this PR
+          CHANGED_FILES=$(gh pr view ${{ github.event.pull_request.number }} \
+            --json files --jq '.files[].path | select(startswith("${{ inputs.claims-path }}/") and endswith(".yaml"))')
+
+          if [ -z "${CHANGED_FILES}" ]; then
+            echo "[ WARNING ] No ${{ inputs.claims-path }}/**/*.yaml files changed. Skipping render."
+            echo "skipped=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          RENDER_SECTIONS_FILE=$(mktemp)
+
+          # Docker host IP for function containers (bridge network workaround — same issue as CMA)
+          DOCKER_HOST_IP=$(ip route show default 2>/dev/null | awk '/default/ {print $3}' | head -1)
+          if [ -z "${DOCKER_HOST_IP}" ]; then DOCKER_HOST_IP="172.17.0.1"; fi
+
+          for FILE in ${CHANGED_FILES}; do
+            echo "[ INFO ] Rendering: ${FILE}"
+            CLAIM_KIND=$(yq '.kind' "${FILE}")
+
+            XR_KIND=$(yq 'select(.spec.names.kind == "'"${CLAIM_KIND}"'") | .spec.names.kind' \
+              "${WORK_DIR}/xrds.yaml" | head -1)
+
+            if [ -z "${XR_KIND}" ]; then
+              echo "[ WARNING ] No XRD found for kind ${CLAIM_KIND}."
+              printf '### `%s`\n\n> ⚠️ No XRD found for kind `%s`.\n\n' \
+                "${FILE}" "${CLAIM_KIND}" >> "${RENDER_SECTIONS_FILE}"
+              continue
+            fi
+
+            export XR_KIND_ENV="${XR_KIND}"
+            yq '. | .kind = env(XR_KIND_ENV) | del(.metadata.namespace)' "${FILE}" \
+              > "${WORK_DIR}/xr.yaml"
+
+            yq 'select(.kind == "Composition") | select(.spec.compositeTypeRef.kind == "'"${XR_KIND}"'")' \
+              "${WORK_DIR}/compositions.yaml" > "${WORK_DIR}/composition.yaml"
+
+            if [ ! -s "${WORK_DIR}/composition.yaml" ]; then
+              echo "[ WARNING ] No Composition found for XR kind ${XR_KIND}."
+              printf '### `%s`\n\n> ⚠️ No Composition found for XR kind `%s`.\n\n' \
+                "${FILE}" "${XR_KIND}" >> "${RENDER_SECTIONS_FILE}"
+              continue
+            fi
+
+            RENDER_OUTPUT=$(crossplane render \
+              -a render.crossplane.io/runtime-docker-publish-address=0.0.0.0 \
+              -a "render.crossplane.io/runtime-docker-target=${DOCKER_HOST_IP}" \
+              "${WORK_DIR}/xr.yaml" \
+              "${WORK_DIR}/composition.yaml" \
+              "${WORK_DIR}/functions.yaml" 2>&1) || true
+
+            printf '### `%s` → `%s`\n\n<details>\n<summary>Composed resources</summary>\n\n```yaml\n%s\n```\n\n</details>\n\n' \
+              "${FILE}" "${XR_KIND}" "${RENDER_OUTPUT}" >> "${RENDER_SECTIONS_FILE}"
+          done
+
+          echo "sections_file=${RENDER_SECTIONS_FILE}" >> $GITHUB_OUTPUT
+
+      - name: Post render comment
+        if: steps.render.outputs.skipped != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const sectionsFile = '${{ steps.render.outputs.sections_file }}';
+            const sections = fs.existsSync(sectionsFile) ? fs.readFileSync(sectionsFile, 'utf8') : '';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `## Crossplane Render Preview\n\nRessources qui seront créées lors du provisioning.\nBase package: \`${{ inputs.xpkg-ref }}\`.\n\n${sections}`
+            });
+
+  # --------------------------------------------------------
+  # Job 3: Annotate claims with GitHub PR context
+  # --------------------------------------------------------
+  annotate:
+    name: Annotate claims
+    runs-on: ubuntu-latest
+    needs: validate
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Inject annotations into changed claims
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_ID: ${{ github.event.repository.id }}
+          REPO_NAME: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          CHANGED_FILES=$(gh pr view ${PR_NUMBER} \
+            --json files --jq '.files[].path | select(startswith("${{ inputs.claims-path }}/") and endswith(".yaml"))')
+
+          if [ -z "${CHANGED_FILES}" ]; then
+            echo "[ WARNING ] No ${{ inputs.claims-path }}/**/*.yaml files changed. Skipping annotation."
+            exit 0
+          fi
+
+          for FILE in ${CHANGED_FILES}; do
+            echo "[ INFO ] Annotating: ${FILE}"
+            yq -i '.metadata.annotations["homelab.io/github-repo-id"] = strenv(REPO_ID)' "${FILE}"
+            yq -i '.metadata.annotations["homelab.io/github-repo"] = strenv(REPO_NAME)' "${FILE}"
+            yq -i '.metadata.annotations["homelab.io/github-pr"] = strenv(PR_NUMBER)' "${FILE}"
+            yq -i '.metadata.annotations["homelab.io/github-sha"] = strenv(COMMIT_SHA)' "${FILE}"
+            yq -i '.metadata.annotations["homelab.io/github-comment-id"] = ""' "${FILE}"
+          done
+
+      - name: Commit annotations
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet; then
+            echo "[ INFO ] Annotations already up-to-date. Nothing to commit."
+            exit 0
+          fi
+
+          git add "${{ inputs.claims-path }}/"
+          git commit -m "chore: inject github annotations [skip ci]
+
+          Annotations added by CI after validation of PR #${PR_NUMBER}.
+            - homelab.io/github-repo-id: ${REPO_ID}
+            - homelab.io/github-repo: ${REPO_NAME}
+            - homelab.io/github-pr: ${PR_NUMBER}
+            - homelab.io/github-sha: ${COMMIT_SHA}"
+          git push
+          echo "[ SUCCESS ] Annotations pushed to ${{ github.head_ref }}."
